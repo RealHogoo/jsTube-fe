@@ -1,29 +1,35 @@
 ﻿# jsTube Frontend
 
-Vite React 기반 미디어 프론트입니다.
+Flutter 기반 미디어 프론트입니다.
 
-## 역할
+## 대상
 
-- 미디어 이미지/영상/노래방 화면
-- TV 노래방 화면
-- 유튜브 저장 화면
-- 웹하드/어드민 연계 UI
+- Flutter Web
+- Android APK
+- Android TV APK 비공식 배포
 
 ## 실행
 
 ```powershell
-npm install
-npm run dev
+flutter pub get
+flutter run -d chrome --dart-define=MEDIA_API_BASE=http://localhost:8084
 ```
 
-기본 개발 주소는 `http://localhost:5174`입니다.
+TV 화면은 웹에서 다음 쿼리로 진입합니다.
+
+```text
+/?karaoke_tv=1
+```
 
 ## 빌드
 
 ```powershell
-npm run build
+flutter build web --dart-define=MEDIA_API_BASE=https://med.js65.myds.me
+flutter build apk --release --dart-define=MEDIA_API_BASE=https://med.js65.myds.me
 ```
 
-## 환경변수
+## 환경값
 
-`.env.example`을 참고해서 API/어드민/웹하드 주소를 설정합니다.
+- `MEDIA_API_BASE`: 미디어 백엔드 API 주소. 비우면 같은 origin의 `/api`를 사용합니다.
+- `ADMIN_BASE_URL`: 어드민 서비스 주소
+- `WEBHARD_BASE_URL`: 웹하드 서비스 주소
