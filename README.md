@@ -1,4 +1,4 @@
-﻿# jsTube Frontend
+# jsTube Frontend
 
 Flutter 기반 미디어 프론트입니다.
 
@@ -24,7 +24,7 @@ TV 화면은 웹에서 다음 쿼리로 진입합니다.
 ## 빌드
 
 ```powershell
-flutter build web --dart-define=MEDIA_API_BASE=https://med.js65.myds.me
+flutter build web --dart-define=MEDIA_API_BASE=https://med.js65.myds.me --dart-define=APK_DOWNLOAD_URL=https://med.js65.myds.me/downloads/jstube-tv.apk
 flutter build apk --release --dart-define=MEDIA_API_BASE=https://med.js65.myds.me
 ```
 
@@ -33,3 +33,4 @@ flutter build apk --release --dart-define=MEDIA_API_BASE=https://med.js65.myds.m
 - `MEDIA_API_BASE`: 미디어 백엔드 API 주소. 비우면 같은 origin의 `/api`를 사용합니다.
 - `ADMIN_BASE_URL`: 어드민 서비스 주소
 - `WEBHARD_BASE_URL`: 웹하드 서비스 주소
+- `APK_DOWNLOAD_URL`: Flutter Web에서 제공할 TV APK 다운로드 주소

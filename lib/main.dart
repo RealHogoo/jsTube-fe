@@ -4,6 +4,7 @@ import 'dart:convert';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:http/http.dart' as http;
+import 'package:url_launcher/url_launcher.dart';
 import 'package:video_player/video_player.dart';
 
 void main() {
@@ -17,6 +18,8 @@ class AppConfig {
       defaultValue: 'http://localhost:8081');
   static const webhardBase = String.fromEnvironment('WEBHARD_BASE_URL',
       defaultValue: 'http://localhost:8083');
+  static const apkDownloadUrl = String.fromEnvironment('APK_DOWNLOAD_URL',
+      defaultValue: '/downloads/jstube-tv.apk');
 
   static String apiUrl(String path) {
     if (path.startsWith('http')) return path;
@@ -307,6 +310,10 @@ class _MediaShellState extends State<MediaShell> {
       appBar: AppBar(
         title: const Text('jsTube 미디어'),
         actions: [
+          TextButton.icon(
+              onPressed: _downloadApk,
+              icon: const Icon(Icons.tv),
+              label: const Text('TV 앱 다운로드')),
           TextButton(onPressed: _sync, child: const Text('웹하드 동기화')),
           TextButton(
               onPressed: () => _openExternal(AppConfig.webhardBase),
@@ -371,9 +378,21 @@ class _MediaShellState extends State<MediaShell> {
     _load(reset: true);
   }
 
-  void _openExternal(String url) {
-    ScaffoldMessenger.of(context)
-        .showSnackBar(SnackBar(content: Text('외부 링크: $url')));
+  Future<void> _downloadApk() async {
+    await _openExternal(AppConfig.apkDownloadUrl);
+  }
+
+  Future<void> _openExternal(String url) async {
+    final uri = Uri.parse(url);
+    final targetUri = uri.hasScheme ? uri : Uri.base.resolveUri(uri);
+    if (await canLaunchUrl(targetUri)) {
+      await launchUrl(targetUri, mode: LaunchMode.externalApplication);
+      return;
+    }
+    if (mounted) {
+      ScaffoldMessenger.of(context)
+          .showSnackBar(SnackBar(content: Text('링크를 열 수 없습니다: $targetUri')));
+    }
   }
 }
 
