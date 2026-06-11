@@ -7,6 +7,8 @@ import 'package:http/http.dart' as http;
 import 'package:url_launcher/url_launcher.dart';
 import 'package:video_player/video_player.dart';
 
+import 'http_client.dart';
+
 void main() {
   runApp(const JsTubeApp());
 }
@@ -25,6 +27,114 @@ class AppConfig {
     if (path.startsWith('http')) return path;
     if (apiBase.isEmpty) return path;
     return '${apiBase.replaceAll(RegExp(r'/$'), '')}$path';
+  }
+}
+
+class AuthSession extends ChangeNotifier {
+  AuthSession._();
+
+  static final instance = AuthSession._();
+
+  String _token = '';
+  String _refreshToken = '';
+  String _userId = '';
+  bool _isAdmin = false;
+  bool _cookieAuthenticated = false;
+  Map<String, bool> _permissions = const {};
+
+  String get token => _token;
+  String get userId => _userId;
+  bool get isAuthenticated => _token.isNotEmpty || _cookieAuthenticated;
+  bool get canWrite => _isAdmin || (_permissions['write'] ?? false);
+
+  Map<String, String> get authHeaders =>
+      _token.isEmpty ? const {} : {'Authorization': 'Bearer $_token'};
+
+  void updateFromLogin(Map<String, dynamic> data, {bool notify = true}) {
+    final user = data['user'] is Map<String, dynamic>
+        ? data['user'] as Map<String, dynamic>
+        : const <String, dynamic>{};
+    _token = '${data['token'] ?? ''}'.trim();
+    _refreshToken = '${data['refresh_token'] ?? ''}'.trim();
+    _cookieAuthenticated = false;
+    _userId = '${user['user_id'] ?? ''}'.trim();
+    _isAdmin = user['super_admin'] == true ||
+        ((user['roles'] as List?) ?? const [])
+            .map((item) => '$item')
+            .any((role) => role == 'ROLE_ADMIN' || role == 'ROLE_SUPER_ADMIN');
+    if (notify) notifyListeners();
+  }
+
+  void updateFromMe(Map<String, dynamic> data) {
+    _userId = '${data['user_id'] ?? _userId}'.trim();
+    _isAdmin = data['is_admin'] == true;
+    _cookieAuthenticated = _userId.isNotEmpty;
+    final rawPermissions = data['permissions'];
+    if (rawPermissions is Map) {
+      _permissions = rawPermissions.map(
+          (key, value) => MapEntry('$key', value == true || '$value' == 'true'));
+    }
+    notifyListeners();
+  }
+
+  void clear() {
+    _token = '';
+    _refreshToken = '';
+    _userId = '';
+    _isAdmin = false;
+    _cookieAuthenticated = false;
+    _permissions = const {};
+    notifyListeners();
+  }
+}
+
+class AuthRepository {
+  final http.Client _client;
+
+  AuthRepository([http.Client? client])
+      : _client = client ?? createAppHttpClient();
+
+  Future<void> login(String userId, String password) async {
+    final response = await _client.post(
+      Uri.parse(AppConfig.adminBase.replaceAll(RegExp(r'/$'), '') + '/login.json'),
+      headers: const {
+        'Accept': 'application/json',
+        'Content-Type': 'application/json',
+      },
+      body: jsonEncode({'user_id': userId, 'user_pw': password}),
+    );
+    final decoded = response.body.isEmpty
+        ? <String, dynamic>{}
+        : jsonDecode(response.body) as Map<String, dynamic>;
+    if (response.statusCode < 200 ||
+        response.statusCode >= 300 ||
+        decoded['ok'] != true) {
+      throw ApiException(
+          decoded['message']?.toString() ?? '로그인에 실패했습니다.',
+          response.statusCode);
+    }
+    final data = decoded['data'];
+    if (data is! Map<String, dynamic> || '${data['token'] ?? ''}'.isEmpty) {
+      throw ApiException('로그인 토큰을 받을 수 없습니다.', response.statusCode);
+    }
+    AuthSession.instance.updateFromLogin(data, notify: false);
+    try {
+      final me = await ApiClient().getJson('/api/me/');
+      AuthSession.instance.updateFromMe(me);
+    } catch (_) {
+      AuthSession.instance.clear();
+      rethrow;
+    }
+  }
+
+  Future<bool> restoreSession() async {
+    try {
+      final me = await ApiClient().getJson('/api/me/');
+      AuthSession.instance.updateFromMe(me);
+      return true;
+    } catch (_) {
+      return false;
+    }
   }
 }
 
@@ -49,7 +159,7 @@ class JsTubeApp extends StatelessWidget {
             seedColor: const Color(0xfffacc15), brightness: Brightness.dark),
       ),
       themeMode: tvMode ? ThemeMode.dark : ThemeMode.system,
-      home: tvMode ? const KaraokeTvScreen() : const MediaShell(),
+      home: AuthGate(child: tvMode ? const KaraokeTvScreen() : const MediaShell()),
     );
   }
 }
@@ -57,23 +167,26 @@ class JsTubeApp extends StatelessWidget {
 class ApiClient {
   final http.Client _client;
 
-  ApiClient([http.Client? client]) : _client = client ?? http.Client();
+  ApiClient([http.Client? client]) : _client = client ?? createAppHttpClient();
 
   Future<Map<String, dynamic>> getJson(String path,
       [Map<String, String>? query]) async {
     final uri =
         Uri.parse(AppConfig.apiUrl(path)).replace(queryParameters: query);
-    final response =
-        await _client.get(uri, headers: const {'Accept': 'application/json'});
+    final response = await _client.get(uri, headers: {
+      'Accept': 'application/json',
+      ...AuthSession.instance.authHeaders,
+    });
     return _decode(response);
   }
 
   Future<Map<String, dynamic>> postJson(String path, [Object? body]) async {
     final response = await _client.post(
       Uri.parse(AppConfig.apiUrl(path)),
-      headers: const {
+      headers: {
         'Accept': 'application/json',
-        'Content-Type': 'application/json'
+        'Content-Type': 'application/json',
+        ...AuthSession.instance.authHeaders,
       },
       body: body == null ? null : jsonEncode(body),
     );
@@ -81,10 +194,9 @@ class ApiClient {
   }
 
   Map<String, dynamic> _decode(http.Response response) {
-    final decoded = response.body.isEmpty
-        ? <String, dynamic>{}
-        : jsonDecode(response.body) as Map<String, dynamic>;
+    final decoded = _decodeJsonObject(response);
     if (response.statusCode == 401 || response.statusCode == 403) {
+      if (response.statusCode == 401) AuthSession.instance.clear();
       throw ApiException(
           decoded['message']?.toString() ?? '로그인이 필요합니다.', response.statusCode);
     }
@@ -99,6 +211,63 @@ class ApiClient {
     }
     final data = decoded['data'];
     return data is Map<String, dynamic> ? data : decoded;
+  }
+
+  Map<String, dynamic> _decodeJsonObject(http.Response response) {
+    if (response.body.isEmpty) {
+      return <String, dynamic>{};
+    }
+    try {
+      final decoded = jsonDecode(response.body);
+      return decoded is Map<String, dynamic>
+          ? decoded
+          : <String, dynamic>{'message': '${response.statusCode}'};
+    } catch (_) {
+      final body = response.body.trim();
+      return <String, dynamic>{
+        'message': body.isEmpty
+            ? 'HTTP ${response.statusCode}'
+            : body.substring(0, body.length > 160 ? 160 : body.length),
+      };
+    }
+  }
+}
+
+class AuthGate extends StatefulWidget {
+  final Widget child;
+
+  const AuthGate({super.key, required this.child});
+
+  @override
+  State<AuthGate> createState() => _AuthGateState();
+}
+
+class _AuthGateState extends State<AuthGate> {
+  final auth = AuthRepository();
+  var checking = true;
+
+  @override
+  void initState() {
+    super.initState();
+    unawaited(_restoreSession());
+  }
+
+  Future<void> _restoreSession() async {
+    await auth.restoreSession();
+    if (mounted) {
+      setState(() => checking = false);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    if (checking) {
+      return const Scaffold(
+        backgroundColor: Color(0xfff3efe5),
+        body: Center(child: CircularProgressIndicator()),
+      );
+    }
+    return widget.child;
   }
 }
 
@@ -156,10 +325,26 @@ class MediaItem {
   }
 
   static String _absoluteUrl(String url) {
-    if (url.isEmpty || url.startsWith('http') || AppConfig.apiBase.isEmpty) {
+    if (url.isEmpty) {
       return url;
     }
-    return AppConfig.apiUrl(url);
+    final absolute = url.startsWith('http') || AppConfig.apiBase.isEmpty
+        ? url
+        : AppConfig.apiUrl(url);
+    return _authenticatedFileUrl(absolute);
+  }
+
+  static String _authenticatedFileUrl(String url) {
+    if (!url.contains('-file/')) return url;
+    final token = AuthSession.instance.token;
+    if (token.isEmpty) return url;
+    final uri = Uri.parse(url);
+    return uri
+        .replace(queryParameters: {
+          ...uri.queryParameters,
+          'access_token': token,
+        })
+        .toString();
   }
 
   static String _karaokeNumber(Map<String, dynamic> json, List<String> tags) {
@@ -237,6 +422,7 @@ class _MediaShellState extends State<MediaShell> {
   var hasMore = false;
   var loading = false;
   var message = '';
+  var authRequired = false;
   var counts = <String, int>{};
   final items = <MediaItem>[];
   final queryController = TextEditingController();
@@ -261,6 +447,7 @@ class _MediaShellState extends State<MediaShell> {
     setState(() {
       loading = true;
       message = '';
+      authRequired = false;
       if (reset) {
         offset = 0;
         hasMore = false;
@@ -270,6 +457,7 @@ class _MediaShellState extends State<MediaShell> {
     try {
       final result = await repo.list(kind: kind, query: query, offset: offset);
       setState(() {
+        authRequired = false;
         items.addAll(result.items);
         offset = items.length;
         hasMore = result.hasMore;
@@ -277,7 +465,11 @@ class _MediaShellState extends State<MediaShell> {
         message = items.isEmpty ? '표시할 자료가 없습니다.' : '';
       });
     } catch (error) {
-      setState(() => message = error.toString());
+      setState(() {
+        authRequired = error is ApiException &&
+            (error.statusCode == 401 || error.statusCode == 403);
+        message = authRequired ? '' : error.toString();
+      });
     } finally {
       if (mounted) setState(() => loading = false);
     }
@@ -298,6 +490,29 @@ class _MediaShellState extends State<MediaShell> {
     }
   }
 
+  Future<void> _logout() async {
+    setState(() {
+      loading = true;
+      message = '';
+    });
+    try {
+      await ApiClient().postJson('/api/logout/');
+    } catch (_) {
+      // Local session cleanup still matters if the server-side logout already expired.
+    } finally {
+      AuthSession.instance.clear();
+      if (mounted) {
+        setState(() {
+          loading = false;
+          authRequired = true;
+          items.clear();
+          offset = 0;
+          hasMore = false;
+        });
+      }
+    }
+  }
+
   void _onScroll() {
     if (!hasMore || loading) return;
     if (scrollController.position.extentAfter < 500) _load(reset: false);
@@ -314,13 +529,20 @@ class _MediaShellState extends State<MediaShell> {
               onPressed: _downloadApk,
               icon: const Icon(Icons.tv),
               label: const Text('TV 앱 다운로드')),
-          TextButton(onPressed: _sync, child: const Text('웹하드 동기화')),
+          if (AuthSession.instance.canWrite)
+            TextButton(onPressed: _sync, child: const Text('웹하드 동기화')),
           TextButton(
               onPressed: () => _openExternal(AppConfig.webhardBase),
               child: const Text('웹하드')),
-          TextButton(
-              onPressed: () => _openExternal(AppConfig.adminBase),
-              child: const Text('어드민')),
+          AnimatedBuilder(
+            animation: AuthSession.instance,
+            builder: (context, _) => TextButton(
+              onPressed:
+                  AuthSession.instance.isAuthenticated ? _logout : _openAdminLogin,
+              child:
+                  Text(AuthSession.instance.isAuthenticated ? '로그아웃' : '로그인'),
+            ),
+          ),
         ],
       ),
       body: Stack(
@@ -341,6 +563,9 @@ class _MediaShellState extends State<MediaShell> {
                     child: Padding(
                         padding: const EdgeInsets.all(16),
                         child: Text(message))),
+              if (authRequired)
+                SliverToBoxAdapter(
+                    child: _AuthRequiredPanel(onOpenAdmin: _openAdminLogin)),
               SliverPadding(
                 padding: const EdgeInsets.all(18),
                 sliver: SliverGrid.builder(
@@ -382,17 +607,63 @@ class _MediaShellState extends State<MediaShell> {
     await _openExternal(AppConfig.apkDownloadUrl);
   }
 
-  Future<void> _openExternal(String url) async {
+  Future<void> _openAdminLogin() async {
+    final adminBase = AppConfig.adminBase.replaceAll(RegExp(r'/$'), '');
+    final loginUri = Uri.parse('$adminBase/service-login-page.do').replace(
+      queryParameters: {
+        'service_nm': 'jsTube',
+        'return_url': Uri.base.toString(),
+      },
+    );
+    await _openExternal(loginUri.toString(), sameWindow: true);
+  }
+
+  Future<void> _openExternal(String url, {bool sameWindow = false}) async {
     final uri = Uri.parse(url);
     final targetUri = uri.hasScheme ? uri : Uri.base.resolveUri(uri);
     if (await canLaunchUrl(targetUri)) {
-      await launchUrl(targetUri, mode: LaunchMode.externalApplication);
+      await launchUrl(
+        targetUri,
+        mode: LaunchMode.externalApplication,
+        webOnlyWindowName: sameWindow ? '_self' : null,
+      );
       return;
     }
     if (mounted) {
       ScaffoldMessenger.of(context)
           .showSnackBar(SnackBar(content: Text('링크를 열 수 없습니다: $targetUri')));
     }
+  }
+}
+
+class _AuthRequiredPanel extends StatelessWidget {
+  final VoidCallback onOpenAdmin;
+
+  const _AuthRequiredPanel({required this.onOpenAdmin});
+
+  @override
+  Widget build(BuildContext context) {
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(16, 10, 16, 4),
+      child: Card(
+        elevation: 0,
+        child: Padding(
+          padding: const EdgeInsets.all(16),
+          child: Row(
+            children: [
+              const Icon(Icons.admin_panel_settings_outlined),
+              const SizedBox(width: 12),
+              const Expanded(child: Text('어드민 로그인 후 jsTube 목록을 볼 수 있습니다.')),
+              FilledButton.icon(
+                onPressed: onOpenAdmin,
+                icon: const Icon(Icons.open_in_new),
+                label: const Text('어드민에서 로그인'),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
   }
 }
 
@@ -511,6 +782,7 @@ class MediaCard extends StatelessWidget {
                     ? Icon(item.kind == 'IMAGE' ? Icons.image : Icons.movie,
                         size: 58, color: const Color(0xff64748b))
                     : Image.network(item.thumbnailUrl,
+                        headers: AuthSession.instance.authHeaders,
                         fit: BoxFit.cover,
                         errorBuilder: (_, __, ___) =>
                             const Icon(Icons.broken_image, size: 54)),
@@ -560,7 +832,8 @@ class MediaDetailScreen extends StatelessWidget {
           if (item.kind == 'VIDEO')
             VideoPanel(url: item.contentUrl, poster: item.thumbnailUrl)
           else
-            Image.network(item.contentUrl, fit: BoxFit.contain),
+            Image.network(item.contentUrl,
+                headers: AuthSession.instance.authHeaders, fit: BoxFit.contain),
           const SizedBox(height: 16),
           Text(item.title,
               style: Theme.of(context)
@@ -1115,7 +1388,8 @@ class _VideoPanelState extends State<VideoPanel> {
   void _load() {
     controller?.dispose();
     if (widget.url.isEmpty) return;
-    controller = VideoPlayerController.networkUrl(Uri.parse(widget.url));
+    controller = VideoPlayerController.networkUrl(Uri.parse(widget.url),
+        httpHeaders: AuthSession.instance.authHeaders);
     initialize = controller!.initialize().then((_) {
       controller!.setLooping(false);
       controller!.play();
