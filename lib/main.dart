@@ -43,9 +43,11 @@ class AuthSession extends ChangeNotifier {
   Map<String, bool> _permissions = const {};
 
   String get token => _token;
+  String get refreshToken => _refreshToken;
   String get userId => _userId;
   bool get isAuthenticated => _token.isNotEmpty || _cookieAuthenticated;
   bool get canWrite => _isAdmin || (_permissions['write'] ?? false);
+  bool get canDelete => _isAdmin || (_permissions['delete'] ?? false);
 
   Map<String, String> get authHeaders =>
       _token.isEmpty ? const {} : {'Authorization': 'Bearer $_token'};
@@ -71,8 +73,8 @@ class AuthSession extends ChangeNotifier {
     _cookieAuthenticated = _userId.isNotEmpty;
     final rawPermissions = data['permissions'];
     if (rawPermissions is Map) {
-      _permissions = rawPermissions.map(
-          (key, value) => MapEntry('$key', value == true || '$value' == 'true'));
+      _permissions = rawPermissions.map((key, value) =>
+          MapEntry('$key', value == true || '$value' == 'true'));
     }
     notifyListeners();
   }
@@ -96,7 +98,8 @@ class AuthRepository {
 
   Future<void> login(String userId, String password) async {
     final response = await _client.post(
-      Uri.parse(AppConfig.adminBase.replaceAll(RegExp(r'/$'), '') + '/login.json'),
+      Uri.parse(
+          '${AppConfig.adminBase.replaceAll(RegExp(r'/$'), '')}/login.json'),
       headers: const {
         'Accept': 'application/json',
         'Content-Type': 'application/json',
@@ -109,8 +112,7 @@ class AuthRepository {
     if (response.statusCode < 200 ||
         response.statusCode >= 300 ||
         decoded['ok'] != true) {
-      throw ApiException(
-          decoded['message']?.toString() ?? '로그인에 실패했습니다.',
+      throw ApiException(decoded['message']?.toString() ?? '로그인에 실패했습니다.',
           response.statusCode);
     }
     final data = decoded['data'];
@@ -159,7 +161,8 @@ class JsTubeApp extends StatelessWidget {
             seedColor: const Color(0xfffacc15), brightness: Brightness.dark),
       ),
       themeMode: tvMode ? ThemeMode.dark : ThemeMode.system,
-      home: AuthGate(child: tvMode ? const KaraokeTvScreen() : const MediaShell()),
+      home: AuthGate(
+          child: tvMode ? const KaraokeTvScreen() : const MediaShell()),
     );
   }
 }
@@ -182,6 +185,19 @@ class ApiClient {
 
   Future<Map<String, dynamic>> postJson(String path, [Object? body]) async {
     final response = await _client.post(
+      Uri.parse(AppConfig.apiUrl(path)),
+      headers: {
+        'Accept': 'application/json',
+        'Content-Type': 'application/json',
+        ...AuthSession.instance.authHeaders,
+      },
+      body: body == null ? null : jsonEncode(body),
+    );
+    return _decode(response);
+  }
+
+  Future<Map<String, dynamic>> patchJson(String path, [Object? body]) async {
+    final response = await _client.patch(
       Uri.parse(AppConfig.apiUrl(path)),
       headers: {
         'Accept': 'application/json',
@@ -289,7 +305,9 @@ class MediaItem {
   final String thumbnailUrl;
   final String contentUrl;
   final String karaokeNumber;
-  final List<String> tags;
+  final List<String> customTags;
+  final List<String> webhardTags;
+  final List<TimeMarker> timeMarkers;
   final int fileSize;
 
   MediaItem({
@@ -300,16 +318,29 @@ class MediaItem {
     required this.thumbnailUrl,
     required this.contentUrl,
     required this.karaokeNumber,
-    required this.tags,
+    required this.customTags,
+    required this.webhardTags,
+    required this.timeMarkers,
     required this.fileSize,
   });
 
+  List<String> get tags => [...customTags, ...webhardTags];
+
   factory MediaItem.fromJson(Map<String, dynamic> json) {
-    final tags = <String>[
-      ...((json['tags'] as List?) ?? const []).map((item) => item.toString()),
-      ...((json['webhard_tags'] as List?) ?? const [])
-          .map((item) => item.toString()),
-    ];
+    final customTags = ((json['tags'] as List?) ?? const [])
+        .map((item) => item.toString())
+        .toList();
+    final webhardTags = ((json['webhard_tags'] as List?) ?? const [])
+        .map((item) => item.toString())
+        .toList();
+    final tags = [...customTags, ...webhardTags];
+    final rawMarkers = ((json['time_markers'] as List?) ?? const [])
+        .whereType<Map<String, dynamic>>()
+        .map(TimeMarker.fromJson)
+        .toList();
+    final markers = rawMarkers.isNotEmpty
+        ? rawMarkers
+        : customTags.map(TimeMarker.tryParse).whereType<TimeMarker>().toList();
     return MediaItem(
       id: int.tryParse('${json['webhard_file_id'] ?? 0}') ?? 0,
       title:
@@ -319,7 +350,9 @@ class MediaItem {
       thumbnailUrl: _absoluteUrl('${json['thumbnail_url'] ?? ''}'),
       contentUrl: _absoluteUrl('${json['content_url'] ?? ''}'),
       karaokeNumber: _karaokeNumber(json, tags),
-      tags: tags,
+      customTags: customTags,
+      webhardTags: webhardTags,
+      timeMarkers: markers,
       fileSize: int.tryParse('${json['file_size'] ?? 0}') ?? 0,
     );
   }
@@ -339,12 +372,10 @@ class MediaItem {
     final token = AuthSession.instance.token;
     if (token.isEmpty) return url;
     final uri = Uri.parse(url);
-    return uri
-        .replace(queryParameters: {
-          ...uri.queryParameters,
-          'access_token': token,
-        })
-        .toString();
+    return uri.replace(queryParameters: {
+      ...uri.queryParameters,
+      'access_token': token,
+    }).toString();
   }
 
   static String _karaokeNumber(Map<String, dynamic> json, List<String> tags) {
@@ -362,6 +393,54 @@ class MediaItem {
         RegExp(r'KY\.?([0-9]{3,7})', caseSensitive: false).firstMatch(text);
     return match == null ? '' : 'KY.${match.group(1)}';
   }
+}
+
+class TimeMarker {
+  final double seconds;
+  final String label;
+  final String raw;
+
+  const TimeMarker({
+    required this.seconds,
+    required this.label,
+    required this.raw,
+  });
+
+  factory TimeMarker.fromJson(Map<String, dynamic> json) {
+    final seconds = double.tryParse('${json['seconds'] ?? 0}') ?? 0;
+    final raw = '${json['raw'] ?? ''}'.trim();
+    final label = '${json['label'] ?? ''}'.trim();
+    return TimeMarker(
+      seconds: seconds,
+      label: label.isEmpty ? raw : label,
+      raw: raw.isEmpty ? '${_formatDuration(seconds)} $label'.trim() : raw,
+    );
+  }
+
+  static TimeMarker? tryParse(String value) {
+    final text = value.trim();
+    final match = RegExp(
+            r'(?:^|[^\d])(?:(\d{1,2}):)?([0-5]?\d):([0-5]\d(?:\.\d{1,3})?)(?!\d)')
+        .firstMatch(text);
+    if (match == null) return null;
+    final hours = int.tryParse(match.group(1) ?? '0') ?? 0;
+    final minutes = int.tryParse(match.group(2) ?? '0') ?? 0;
+    final seconds = double.tryParse(match.group(3) ?? '0') ?? 0;
+    final total = hours * 3600 + minutes * 60 + seconds;
+    final label = text.replaceFirst(match.group(0) ?? '', ' ').trim();
+    return TimeMarker(
+        seconds: total, label: label.isEmpty ? text : label, raw: text);
+  }
+}
+
+String _formatDuration(double totalSeconds) {
+  final rounded = totalSeconds.round();
+  final hours = rounded ~/ 3600;
+  final minutes = (rounded % 3600) ~/ 60;
+  final seconds = rounded % 60;
+  String two(int value) => value.toString().padLeft(2, '0');
+  if (hours > 0) return '$hours:${two(minutes)}:${two(seconds)}';
+  return '${two(minutes)}:${two(seconds)}';
 }
 
 class MediaRepository {
@@ -395,6 +474,23 @@ class MediaRepository {
 
   Future<void> sync() async {
     await api.postJson('/api/sync/');
+  }
+
+  Future<MediaItem> update(int id,
+      {required String title, required List<String> tags}) async {
+    final data = await api.patchJson('/api/media/$id/', {
+      'title': title,
+      'tags': tags,
+    });
+    final item = data['item'];
+    if (item is Map<String, dynamic>) {
+      return MediaItem.fromJson(item);
+    }
+    throw ApiException('updated media item is invalid', 500);
+  }
+
+  Future<void> delete(int id) async {
+    await api.postJson('/api/media/$id/delete/');
   }
 }
 
@@ -537,8 +633,9 @@ class _MediaShellState extends State<MediaShell> {
           AnimatedBuilder(
             animation: AuthSession.instance,
             builder: (context, _) => TextButton(
-              onPressed:
-                  AuthSession.instance.isAuthenticated ? _logout : _openAdminLogin,
+              onPressed: AuthSession.instance.isAuthenticated
+                  ? _logout
+                  : _openAdminLogin,
               child:
                   Text(AuthSession.instance.isAuthenticated ? '로그아웃' : '로그인'),
             ),
@@ -576,8 +673,11 @@ class _MediaShellState extends State<MediaShell> {
                     crossAxisSpacing: 16,
                     mainAxisSpacing: 16,
                   ),
-                  itemBuilder: (context, index) =>
-                      MediaCard(item: items[index]),
+                  itemBuilder: (context, index) => MediaCard(
+                    item: items[index],
+                    onChanged: _replaceItem,
+                    onDeleted: _removeItem,
+                  ),
                 ),
               ),
               const SliverToBoxAdapter(child: SizedBox(height: 80)),
@@ -601,6 +701,19 @@ class _MediaShellState extends State<MediaShell> {
       queryController.clear();
     });
     _load(reset: true);
+  }
+
+  void _replaceItem(MediaItem item) {
+    final index = items.indexWhere((entry) => entry.id == item.id);
+    if (index < 0) return;
+    setState(() => items[index] = item);
+  }
+
+  void _removeItem(int id) {
+    setState(() {
+      items.removeWhere((entry) => entry.id == id);
+      offset = items.length;
+    });
   }
 
   Future<void> _downloadApk() async {
@@ -759,8 +872,15 @@ class _Tabs extends StatelessWidget {
 
 class MediaCard extends StatelessWidget {
   final MediaItem item;
+  final ValueChanged<MediaItem> onChanged;
+  final ValueChanged<int> onDeleted;
 
-  const MediaCard({super.key, required this.item});
+  const MediaCard({
+    super.key,
+    required this.item,
+    required this.onChanged,
+    required this.onDeleted,
+  });
 
   @override
   Widget build(BuildContext context) {
@@ -769,8 +889,13 @@ class MediaCard extends StatelessWidget {
       elevation: 0,
       color: Colors.white,
       child: InkWell(
-        onTap: () => Navigator.of(context).push(
-            MaterialPageRoute(builder: (_) => MediaDetailScreen(item: item))),
+        onTap: () => Navigator.of(context).push(MaterialPageRoute(
+          builder: (_) => MediaDetailScreen(
+            item: item,
+            onChanged: onChanged,
+            onDeleted: onDeleted,
+          ),
+        )),
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
@@ -817,38 +942,468 @@ class MediaCard extends StatelessWidget {
   }
 }
 
-class MediaDetailScreen extends StatelessWidget {
+class MediaDetailScreen extends StatefulWidget {
   final MediaItem item;
+  final ValueChanged<MediaItem> onChanged;
+  final ValueChanged<int> onDeleted;
 
-  const MediaDetailScreen({super.key, required this.item});
+  const MediaDetailScreen({
+    super.key,
+    required this.item,
+    required this.onChanged,
+    required this.onDeleted,
+  });
+
+  @override
+  State<MediaDetailScreen> createState() => _MediaDetailScreenState();
+}
+
+class _MediaDetailScreenState extends State<MediaDetailScreen> {
+  late MediaItem item = widget.item;
+  late final titleController = TextEditingController(text: item.title);
+  late final tagsController =
+      TextEditingController(text: _visibleTags(item.customTags).join(', '));
+  late final markerRows = item.timeMarkers
+      .map((marker) => _MarkerEditRow.fromMarker(marker))
+      .toList();
+  final videoPanelKey = GlobalKey<_VideoPanelState>();
+  final repo = MediaRepository(ApiClient());
+  var currentVideoPosition = Duration.zero;
+  var saving = false;
+  var message = '';
+
+  @override
+  void dispose() {
+    titleController.dispose();
+    tagsController.dispose();
+    for (final row in markerRows) {
+      row.dispose();
+    }
+    super.dispose();
+  }
 
   @override
   Widget build(BuildContext context) {
+    final canWrite = AuthSession.instance.canWrite;
+    final canDelete = AuthSession.instance.canDelete;
     return Scaffold(
       appBar: AppBar(title: Text(item.title)),
-      body: ListView(
-        padding: const EdgeInsets.all(18),
+      body: Stack(
         children: [
-          if (item.kind == 'VIDEO')
-            VideoPanel(url: item.contentUrl, poster: item.thumbnailUrl)
-          else
-            Image.network(item.contentUrl,
-                headers: AuthSession.instance.authHeaders, fit: BoxFit.contain),
-          const SizedBox(height: 16),
-          Text(item.title,
-              style: Theme.of(context)
-                  .textTheme
-                  .headlineSmall
-                  ?.copyWith(fontWeight: FontWeight.bold)),
-          const SizedBox(height: 8),
-          Text(item.fileName),
-          const SizedBox(height: 8),
-          Wrap(
-              spacing: 8,
-              children:
-                  item.tags.map((tag) => Chip(label: Text(tag))).toList()),
+          ListView(
+            padding: const EdgeInsets.all(18),
+            children: [
+              if (item.kind == 'VIDEO')
+                VideoPanel(
+                  key: videoPanelKey,
+                  url: item.contentUrl,
+                  poster: item.thumbnailUrl,
+                  onPositionChanged: _updateVideoPosition,
+                )
+              else
+                Image.network(item.contentUrl,
+                    headers: AuthSession.instance.authHeaders,
+                    fit: BoxFit.contain),
+              const SizedBox(height: 16),
+              if (canWrite || canDelete) _detailActions(canWrite, canDelete),
+              if (canWrite || canDelete) const SizedBox(height: 12),
+              if (canWrite) _editPanel(context) else _readOnlyInfo(context),
+              if (message.isNotEmpty) ...[
+                const SizedBox(height: 12),
+                Text(message, style: const TextStyle(color: Color(0xffb91c1c))),
+              ],
+            ],
+          ),
+          if (saving) const LoadingLayer(),
         ],
       ),
+    );
+  }
+
+  Widget _detailActions(bool canWrite, bool canDelete) {
+    return Wrap(
+      spacing: 8,
+      runSpacing: 8,
+      alignment: WrapAlignment.end,
+      children: [
+        if (canDelete)
+          OutlinedButton.icon(
+            onPressed: saving ? null : _confirmDelete,
+            icon: const Icon(Icons.delete_outline),
+            label: const Text('삭제'),
+          ),
+        if (canWrite)
+          FilledButton.icon(
+            onPressed: saving ? null : _save,
+            icon: const Icon(Icons.save_outlined),
+            label: const Text('저장'),
+          ),
+      ],
+    );
+  }
+
+  Widget _readOnlyInfo(BuildContext context) {
+    return Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+      Text(item.title,
+          style: Theme.of(context)
+              .textTheme
+              .headlineSmall
+              ?.copyWith(fontWeight: FontWeight.bold)),
+      const SizedBox(height: 8),
+      Text(item.fileName),
+      const SizedBox(height: 8),
+      Wrap(
+          spacing: 8,
+          runSpacing: 8,
+          children: item.tags.map((tag) => Chip(label: Text(tag))).toList()),
+      if (item.timeMarkers.isNotEmpty) ...[
+        const SizedBox(height: 16),
+        Text('타임라인', style: Theme.of(context).textTheme.titleMedium),
+        const SizedBox(height: 8),
+        for (final marker in item.timeMarkers)
+          ListTile(
+            dense: true,
+            leading: const Icon(Icons.schedule),
+            title: Text(marker.label),
+            trailing: Text(_formatDuration(marker.seconds)),
+          ),
+      ],
+    ]);
+  }
+
+  Widget _timelineJumpBar() {
+    final markers = _editableMarkers();
+    if (markers.isEmpty) {
+      return const SizedBox.shrink();
+    }
+    return Wrap(
+      spacing: 8,
+      runSpacing: 8,
+      children: [
+        for (final marker in markers)
+          ActionChip(
+            avatar: const Icon(Icons.play_arrow, size: 18),
+            label: Text('${_formatDuration(marker.seconds)} ${marker.label}'),
+            onPressed: () => _seekVideoTo(marker.seconds),
+          ),
+      ],
+    );
+  }
+
+  Widget _editPanel(BuildContext context) {
+    return Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+      TextField(
+        controller: titleController,
+        decoration: const InputDecoration(
+          labelText: '제목',
+          border: OutlineInputBorder(),
+        ),
+      ),
+      const SizedBox(height: 12),
+      TextField(
+        controller: tagsController,
+        minLines: 1,
+        maxLines: 3,
+        decoration: const InputDecoration(
+          labelText: '태그',
+          helperText: '쉼표 또는 줄바꿈으로 구분',
+          border: OutlineInputBorder(),
+        ),
+      ),
+      if (item.webhardTags.isNotEmpty) ...[
+        const SizedBox(height: 8),
+        Wrap(
+          spacing: 8,
+          runSpacing: 8,
+          children: item.webhardTags
+              .map((tag) => InputChip(
+                    label: Text(tag),
+                    avatar: const Icon(Icons.folder_outlined, size: 18),
+                    onPressed: null,
+                  ))
+              .toList(),
+        ),
+      ],
+      const SizedBox(height: 18),
+      if (item.kind == 'VIDEO') ...[
+        _timelineJumpBar(),
+        if (_editableMarkers().isNotEmpty) const SizedBox(height: 12),
+      ],
+      Row(children: [
+        Expanded(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text('타임라인',
+                  style: Theme.of(context)
+                      .textTheme
+                      .titleMedium
+                      ?.copyWith(fontWeight: FontWeight.w800)),
+              if (item.kind == 'VIDEO')
+                Text(
+                    '현재 ${_formatDuration(currentVideoPosition.inMilliseconds / 1000)}',
+                    style: const TextStyle(color: Color(0xff64748b))),
+            ],
+          ),
+        ),
+        if (item.kind == 'VIDEO') ...[
+          OutlinedButton.icon(
+            onPressed: _addMarkerAtCurrentTime,
+            icon: const Icon(Icons.my_location),
+            label: const Text('현재 시간 추가'),
+          ),
+          const SizedBox(width: 8),
+        ],
+        OutlinedButton.icon(
+          onPressed: _addMarker,
+          icon: const Icon(Icons.add),
+          label: const Text('추가'),
+        ),
+      ]),
+      const SizedBox(height: 8),
+      for (var index = 0; index < markerRows.length; index++)
+        _MarkerEditor(
+          row: markerRows[index],
+          canUseCurrentTime: item.kind == 'VIDEO',
+          onUseCurrentTime: () => _setMarkerToCurrentTime(index),
+          onDelete: () => _removeMarker(index),
+        ),
+    ]);
+  }
+
+  Future<void> _save() async {
+    setState(() {
+      saving = true;
+      message = '';
+    });
+    try {
+      final tags = [
+        ..._splitTags(tagsController.text),
+        ..._markerTags(),
+      ];
+      final updated = await repo.update(
+        item.id,
+        title: titleController.text.trim(),
+        tags: tags,
+      );
+      setState(() {
+        item = updated;
+        tagsController.text = _visibleTags(updated.customTags).join(', ');
+        _replaceMarkerRows(updated.timeMarkers);
+      });
+      widget.onChanged(updated);
+      if (mounted) {
+        ScaffoldMessenger.of(context)
+            .showSnackBar(const SnackBar(content: Text('저장했습니다.')));
+      }
+    } catch (error) {
+      setState(() => message = error.toString());
+    } finally {
+      if (mounted) setState(() => saving = false);
+    }
+  }
+
+  Future<void> _confirmDelete() async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('삭제'),
+        content: Text('${item.title}\n\n삭제하시겠습니까?'),
+        actions: [
+          TextButton(
+              onPressed: () => Navigator.of(context).pop(false),
+              child: const Text('취소')),
+          FilledButton(
+              onPressed: () => Navigator.of(context).pop(true),
+              child: const Text('삭제')),
+        ],
+      ),
+    );
+    if (confirmed != true) return;
+    setState(() {
+      saving = true;
+      message = '';
+    });
+    try {
+      await repo.delete(item.id);
+      widget.onDeleted(item.id);
+      if (mounted) Navigator.of(context).pop();
+    } catch (error) {
+      setState(() => message = error.toString());
+    } finally {
+      if (mounted) setState(() => saving = false);
+    }
+  }
+
+  void _addMarker() {
+    setState(() => markerRows.add(_MarkerEditRow.empty()));
+  }
+
+  void _addMarkerAtCurrentTime() {
+    final seconds = currentVideoPosition.inMilliseconds / 1000;
+    setState(() => markerRows.add(_MarkerEditRow.fromPosition(seconds)));
+  }
+
+  void _setMarkerToCurrentTime(int index) {
+    if (index < 0 || index >= markerRows.length) return;
+    markerRows[index].time.text =
+        _formatDuration(currentVideoPosition.inMilliseconds / 1000);
+    setState(() {});
+  }
+
+  void _updateVideoPosition(Duration position) {
+    if (position.inSeconds == currentVideoPosition.inSeconds) return;
+    setState(() => currentVideoPosition = position);
+  }
+
+  void _seekVideoTo(double seconds) {
+    setState(() => currentVideoPosition =
+        Duration(milliseconds: (seconds * 1000).round()));
+    videoPanelKey.currentState?.seekToSeconds(seconds);
+  }
+
+  void _removeMarker(int index) {
+    setState(() => markerRows.removeAt(index).dispose());
+  }
+
+  void _replaceMarkerRows(List<TimeMarker> markers) {
+    for (final row in markerRows) {
+      row.dispose();
+    }
+    markerRows
+      ..clear()
+      ..addAll(markers.map((marker) => _MarkerEditRow.fromMarker(marker)));
+  }
+
+  List<String> _markerTags() {
+    final markers = <TimeMarker>[];
+    for (final row in markerRows) {
+      final time = row.time.text.trim();
+      final label = row.label.text.trim();
+      if (time.isEmpty && label.isEmpty) continue;
+      final marker = TimeMarker.tryParse(time);
+      if (marker == null) {
+        throw ApiException('타임라인 시간 형식은 00:00 또는 01:02:03 입니다.', 400);
+      }
+      markers.add(TimeMarker(
+        seconds: marker.seconds,
+        label: label.isEmpty ? _formatDuration(marker.seconds) : label,
+        raw: '${_formatDuration(marker.seconds)} $label'.trim(),
+      ));
+    }
+    markers.sort((a, b) => a.seconds.compareTo(b.seconds));
+    final seen = <int>{};
+    return [
+      for (final marker in markers)
+        if (seen.add((marker.seconds * 1000).round()))
+          '${_formatDuration(marker.seconds)} ${marker.label}'.trim()
+    ];
+  }
+
+  List<TimeMarker> _editableMarkers() {
+    final markers = <TimeMarker>[];
+    for (final row in markerRows) {
+      final marker = TimeMarker.tryParse(row.time.text);
+      if (marker == null) continue;
+      final label = row.label.text.trim();
+      markers.add(TimeMarker(
+        seconds: marker.seconds,
+        label: label.isEmpty ? _formatDuration(marker.seconds) : label,
+        raw: '${_formatDuration(marker.seconds)} $label'.trim(),
+      ));
+    }
+    markers.sort((a, b) => a.seconds.compareTo(b.seconds));
+    return markers;
+  }
+
+  static List<String> _splitTags(String value) => value
+      .split(RegExp(r'[,\n]'))
+      .map((tag) => tag.trim())
+      .where((tag) => tag.isNotEmpty)
+      .toSet()
+      .toList();
+
+  static List<String> _visibleTags(List<String> tags) =>
+      tags.where((tag) => TimeMarker.tryParse(tag) == null).toList();
+}
+
+class _MarkerEditRow {
+  final TextEditingController time;
+  final TextEditingController label;
+
+  _MarkerEditRow({required this.time, required this.label});
+
+  factory _MarkerEditRow.empty() => _MarkerEditRow(
+        time: TextEditingController(),
+        label: TextEditingController(),
+      );
+
+  factory _MarkerEditRow.fromMarker(TimeMarker marker) => _MarkerEditRow(
+        time: TextEditingController(text: _formatDuration(marker.seconds)),
+        label: TextEditingController(text: marker.label),
+      );
+
+  factory _MarkerEditRow.fromPosition(double seconds) => _MarkerEditRow(
+        time: TextEditingController(text: _formatDuration(seconds)),
+        label: TextEditingController(),
+      );
+
+  void dispose() {
+    time.dispose();
+    label.dispose();
+  }
+}
+
+class _MarkerEditor extends StatelessWidget {
+  final _MarkerEditRow row;
+  final bool canUseCurrentTime;
+  final VoidCallback onUseCurrentTime;
+  final VoidCallback onDelete;
+
+  const _MarkerEditor({
+    required this.row,
+    required this.canUseCurrentTime,
+    required this.onUseCurrentTime,
+    required this.onDelete,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 8),
+      child: Row(children: [
+        SizedBox(
+          width: 118,
+          child: TextField(
+            controller: row.time,
+            decoration: const InputDecoration(
+              labelText: '시간',
+              hintText: '00:00',
+              border: OutlineInputBorder(),
+            ),
+          ),
+        ),
+        const SizedBox(width: 8),
+        Expanded(
+          child: TextField(
+            controller: row.label,
+            decoration: const InputDecoration(
+              labelText: '라벨',
+              border: OutlineInputBorder(),
+            ),
+          ),
+        ),
+        if (canUseCurrentTime)
+          TextButton(
+            onPressed: onUseCurrentTime,
+            child: const Text('현재'),
+          ),
+        IconButton(
+          tooltip: '삭제',
+          onPressed: onDelete,
+          icon: const Icon(Icons.remove_circle_outline),
+        ),
+      ]),
     );
   }
 }
@@ -1356,8 +1911,14 @@ class _KeyDebug extends StatelessWidget {
 class VideoPanel extends StatefulWidget {
   final String url;
   final String poster;
+  final ValueChanged<Duration>? onPositionChanged;
 
-  const VideoPanel({super.key, required this.url, required this.poster});
+  const VideoPanel({
+    super.key,
+    required this.url,
+    required this.poster,
+    this.onPositionChanged,
+  });
 
   @override
   State<VideoPanel> createState() => _VideoPanelState();
@@ -1366,6 +1927,7 @@ class VideoPanel extends StatefulWidget {
 class _VideoPanelState extends State<VideoPanel> {
   VideoPlayerController? controller;
   Future<void>? initialize;
+  int lastReportedSecond = -1;
 
   @override
   void initState() {
@@ -1381,20 +1943,60 @@ class _VideoPanelState extends State<VideoPanel> {
 
   @override
   void dispose() {
+    controller?.removeListener(_reportPosition);
     controller?.dispose();
     super.dispose();
   }
 
   void _load() {
+    controller?.removeListener(_reportPosition);
     controller?.dispose();
+    lastReportedSecond = -1;
     if (widget.url.isEmpty) return;
     controller = VideoPlayerController.networkUrl(Uri.parse(widget.url),
         httpHeaders: AuthSession.instance.authHeaders);
+    controller!.addListener(_reportPosition);
     initialize = controller!.initialize().then((_) {
       controller!.setLooping(false);
       controller!.play();
+      _reportPosition();
     });
     setState(() {});
+  }
+
+  void _reportPosition() {
+    final callback = widget.onPositionChanged;
+    final value = controller?.value;
+    if (value == null || !value.isInitialized) return;
+    final second = value.position.inSeconds;
+    if (second == lastReportedSecond) return;
+    lastReportedSecond = second;
+    if (mounted) setState(() {});
+    callback?.call(value.position);
+  }
+
+  Future<void> _seekRelative(int seconds) async {
+    final value = controller?.value;
+    if (controller == null || value == null || !value.isInitialized) return;
+    final target = value.position + Duration(seconds: seconds);
+    await _seekTo(target);
+  }
+
+  Future<void> _seekTo(Duration target) async {
+    final value = controller?.value;
+    if (controller == null || value == null || !value.isInitialized) return;
+    final duration = value.duration;
+    final clamped = target < Duration.zero
+        ? Duration.zero
+        : target > duration
+            ? duration
+            : target;
+    await controller!.seekTo(clamped);
+    _reportPosition();
+  }
+
+  Future<void> seekToSeconds(double seconds) {
+    return _seekTo(Duration(milliseconds: (seconds * 1000).round()));
   }
 
   @override
@@ -1412,20 +2014,77 @@ class _VideoPanelState extends State<VideoPanel> {
               color: Colors.black,
               child: Center(child: CircularProgressIndicator()));
         }
-        return Stack(
-          alignment: Alignment.bottomCenter,
+        final value = controller!.value;
+        final duration = value.duration;
+        final position = value.position > duration ? duration : value.position;
+        final maxMillis = duration.inMilliseconds <= 0
+            ? 1.0
+            : duration.inMilliseconds.toDouble();
+        final positionMillis =
+            position.inMilliseconds.clamp(0, maxMillis.toInt()).toDouble();
+        return Column(
+          mainAxisSize: MainAxisSize.min,
           children: [
-            AspectRatio(
-                aspectRatio: controller!.value.aspectRatio,
-                child: VideoPlayer(controller!)),
-            VideoProgressIndicator(controller!, allowScrubbing: true),
-            Positioned.fill(
-                child: Material(
-                    color: Colors.transparent,
-                    child: InkWell(
-                        onTap: () => setState(() => controller!.value.isPlaying
-                            ? controller!.pause()
-                            : controller!.play())))),
+            Stack(
+              alignment: Alignment.bottomCenter,
+              children: [
+                AspectRatio(
+                    aspectRatio: value.aspectRatio,
+                    child: VideoPlayer(controller!)),
+                Positioned.fill(
+                    child: Material(
+                        color: Colors.transparent,
+                        child: InkWell(
+                            onTap: () => setState(() =>
+                                controller!.value.isPlaying
+                                    ? controller!.pause()
+                                    : controller!.play())))),
+                VideoProgressIndicator(controller!, allowScrubbing: true),
+              ],
+            ),
+            Container(
+              color: Colors.black,
+              padding: const EdgeInsets.fromLTRB(8, 4, 8, 8),
+              child: Row(
+                children: [
+                  IconButton(
+                    tooltip: '10초 뒤로',
+                    color: Colors.white,
+                    onPressed: () => _seekRelative(-10),
+                    icon: const Icon(Icons.replay_10),
+                  ),
+                  IconButton(
+                    tooltip: value.isPlaying ? '일시정지' : '재생',
+                    color: Colors.white,
+                    onPressed: () => setState(() => value.isPlaying
+                        ? controller!.pause()
+                        : controller!.play()),
+                    icon: Icon(value.isPlaying
+                        ? Icons.pause_circle_outline
+                        : Icons.play_circle_outline),
+                  ),
+                  IconButton(
+                    tooltip: '10초 앞으로',
+                    color: Colors.white,
+                    onPressed: () => _seekRelative(10),
+                    icon: const Icon(Icons.forward_10),
+                  ),
+                  Text(
+                    '${_formatDuration(position.inMilliseconds / 1000)} / ${_formatDuration(duration.inMilliseconds / 1000)}',
+                    style: const TextStyle(color: Colors.white70),
+                  ),
+                  Expanded(
+                    child: Slider(
+                      value: positionMillis,
+                      min: 0,
+                      max: maxMillis,
+                      onChanged: (value) =>
+                          _seekTo(Duration(milliseconds: value.round())),
+                    ),
+                  ),
+                ],
+              ),
+            ),
           ],
         );
       },
